@@ -165,6 +165,9 @@ def try_import(mod, only_modules=False):
     completions.extend(getattr(m, '__all__', []))
     if m_is_init:
         completions.extend(module_list(os.path.dirname(m.__file__)))
+    # snoop the custom paths in case the parent module is split
+    for p in getattr(m, '__path__', []):
+        completions.extend(module_list(p))
     completions = set(completions)
     if '__init__' in completions:
         completions.remove('__init__')
