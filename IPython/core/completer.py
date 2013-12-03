@@ -74,6 +74,8 @@ import keyword
 import os
 import re
 import sys
+import types
+import collections
 
 from IPython.config.configurable import Configurable
 from IPython.core.error import TryNext
@@ -218,8 +220,31 @@ def penalize_magics_key(word):
 
 class Bunch(object): pass
 
+class PostFix(object):
+    """
+    Effectively a static class which encapsulates a bunch of postfix defs.
+    
+    """
 
-DELIMS = ' \t\n`!@#$^&*()=+[{]}\\|;:\'",<>?'
+    ## delimiters which support the type completers
+    DELIMS = ' \t\n`!@#$^&*=+\\|;:",<>?'
+
+    ## postfix strings for types
+    LIST = '['
+    DICT = "['"
+    CALL = '('
+    OBJ  = '.'
+
+    ## helpful defs
+    SQUOTE = "'"
+    DQUOTE = '"'
+    LIST_CLOSE = ']'
+    DICT_CLOSE = "']"
+    CALL_CLOSE = ')'
+
+
+#DELIMS = ' \t\n`!@#$^&*=+\\|;:\'",<>?'
+DELIMS = ' \t\n`!@#$^&*=+\\|;:,<>?'
 GREEDY_DELIMS = ' =\r\n'
 
 
@@ -284,6 +309,35 @@ class Completer(Configurable):
         """
     )
     
+    use_postfix = CBool(False, config=True,
+        help="""Activate postfix indicator
+
+        This will enable the feature to append syntactic notation to matches
+        providing indication as to what type they are.
+
+        Append:
+            (  -  any callable item
+            [  -  any list
+            [' -  any dictionary
+        """
+    )
+
+    postfix_verbose = Enum((0,1,2), default_value=1, config=True,
+        help="""Provide verbose postfix suggestions.
+
+        This is only valid if use_postfix=True.  Verbosity is as follows:
+
+        0 - No postfix notations will be appended until you've isolate a
+            single attribute name.
+        1 - In multiple-completion cases, types deriving from list, dict and
+            functions will have "[", "['" or "(" appended respectively. Detailed
+            operations are made available once a single attribute is determined.
+        2 - Multiple-completion cases will have duplicate or triplicate entries
+            differing only by the "interface" character at the end.  This can
+            make the tab completion lists pretty long.
+        """
+    )
+
 
     def __init__(self, namespace=None, global_namespace=None, **kwargs):
         """Create a new completer for the command line.
@@ -412,9 +466,141 @@ class Completer(Configurable):
             pass
         # Build match list to return
         n = len(attr)
-        res = ["%s.%s" % (expr, w) for w in words if w[:n] == attr ]
-        return res
+        
+        # original functionality
+        if not self.use_postfix:
+            res = ["%s.%s" % (expr, w) for w in words if w[:n] == attr ]
+            return res
+        
+        # tweak in a postfix visual reference
+        res = []
+        subset = []
 
+        # first create a subset -- the ones we care about
+        for w in words:
+                
+            # ignore unrelated stuff 
+            if w[:n] != attr:
+                continue
+                
+            # handle properties carefully -- we don't want to *call* them
+            try:
+                val = getattr(type(obj), w)
+                subset.append( (w, val) )
+                continue
+                
+            except AttributeError:
+                # not all attribs are part of the type
+                # handle normal attribs
+                if hasattr(obj, w):
+                    val = getattr(obj, w)
+                    subset.append( (w, val) )
+
+        # now, setup the matches
+        for ss in subset:
+            apl = self._append_postfix(ss[1],
+                                       "%s.%s" % (expr, ss[0]), len(subset))
+            for ap in apl:
+                res.append(ap)
+        return res
+        
+    def _append_postfix(self, val, text, total_completions=0):
+        """Figure out what postfix symbol to append.
+        """
+        #io.rprint("_ap: text=%s tc=%d" % (text, total_completions))
+        
+        # observer the request
+        if not self.use_postfix:
+            io.rprint("    no-post-fix")
+            return [ text ]
+
+        # ignore the postfix additions as preferred
+        if total_completions > 1:
+
+            if self.postfix_verbose == 0:
+                #print("    omit-postfix (%d)" % total_completions)
+                return [ text ]
+
+            elif self.postfix_verbose == 1:
+                if isinstance( val, dict ):
+                    return [ text + PostFix.DICT ]
+                elif isinstance( val, list ):
+                    return [ text + PostFix.LIST ]
+                elif isinstance(val, collections.Callable):
+                    return [ text + PostFix.CALL ]
+                else:
+                    return [ text ]
+
+            else:
+                # fall through and decode EVERYTHING
+                pass
+
+
+        # prepare multiple results
+        items = []
+
+        # handle scalars
+        if isinstance( val, property ):
+            #io.rprint("    property")
+            items.append( text )
+            
+        elif isinstance( val, int ) or isinstance( val, float ):
+            #io.rprint("    int,float")
+            items.append( text )                    # scalar itself
+            items.append( text + PostFix.OBJ )      # object completion
+
+        # handle strings
+        elif isinstance( val, str ):
+            #io.rprint("    str")
+            items.append( text )                    # scalar itself
+            items.append( text + PostFix.OBJ )      # object completion
+            items.append( text + PostFix.LIST )     # list completion
+            
+        # handle lists
+        elif isinstance( val, list ):
+            #io.rprint("    list")
+            items.append( text + PostFix.OBJ )      # object completion
+            items.append( text + PostFix.LIST )     # list completion
+
+        # handle dicts
+        elif isinstance( val, dict ):
+            #io.rprint("    dict")
+            items.append( text + PostFix.OBJ )      # object completion
+            items.append( text + PostFix.DICT )     # dict completion
+
+        # handle common callables
+        elif isinstance(val, collections.Callable):
+            # skip object completion
+            #io.rprint("    callable")
+            items.append( text + PostFix.CALL )     # callable completion
+
+        # handle general objects
+        else:
+            # always add its "object" completion
+            #io.rprint("    object")
+            items.append( text + PostFix.OBJ )
+
+            # if it is callable, then provide the functional notation
+            if isinstance(val, collections.Callable):
+                #io.rprint("    ... callable")
+                items.append( text + PostFix.CALL )
+
+            # is it iterable?
+            if hasattr(val, '__getitem__'):
+                #io.rprint("    ... collection")
+                try:
+                    v = val[0]
+                    items.append( text + PostFix.LIST )  # yup, some sort of list
+                except TypeError:
+                    # wrong key type -- must be a general dictionary
+                    items.append( text + PostFix.DICT )
+                except KeyError:
+                    # invalid key -- likely a dictionary
+                    items.append( text + PostFix.DICT )
+                except IndexError:
+                    pass   # empty list -- the object notation will handle it
+
+        return items
 
 def get__all__entries(obj):
     """returns the strings in the __all__ attribute"""
@@ -538,7 +724,12 @@ class IPCompleter(Completer):
                          self.file_matches,
                          self.magic_matches,
                          self.python_func_kw_matches,
+                         self.python_set_matches,
                          ]
+
+        # force updates to account for "initial" configuration settings
+        if self.greedy:
+            self._greedy_changed('greedy', not self.greedy, self.greedy)
 
     def all_completions(self, text):
         """
@@ -803,6 +994,153 @@ class IPCompleter(Completer):
                 if namedArg.startswith(text):
                     argMatches.append("%s=" %namedArg)
         return argMatches
+
+    def python_set_matches(self,text):
+        """Match set parameters the last open array/dict/..."""
+
+        #io.rprint("PSM: %r %r" % (text, self.text_until_cursor))
+   
+        #if "." in text: # a parameter cannot be dotted
+        #    return []
+        try: regexp = self.__setParamsRegex
+        except AttributeError:
+            regexp = self.__setParamsRegex = re.compile(r'''
+                '.*?$        |    # open-ended single quoted string at the end or
+                ".*?$        |    # open-ended double quoted string at the end or
+                '.*?(?<!\\)' |    # single quoted strings or
+                ".*?(?<!\\)" |    # double quoted strings or
+                \w+          |    # identifier
+                \S                # other characters
+                ''', re.VERBOSE | re.DOTALL)
+        # 1. find the nearest identifier that comes before an unclosed
+        # parenthesis before the cursor
+        # e.g. for "foo (1+bar(x), pa<cursor>,a=1)", the candidate is "foo"
+        tokens = regexp.findall(self.text_until_cursor)
+
+        #io.rprint("PSM: A tokens=" + str(tokens))
+
+        # figure out what to do
+        open_arrays = tokens.count(PostFix.LIST) - tokens.count(PostFix.LIST_CLOSE)
+        open_squotes = tokens.count(PostFix.SQUOTE)
+        open_dquotes = tokens.count(PostFix.DQUOTE)
+
+        # bail if it is not our dept
+        if open_arrays == 0:
+            return []
+        
+        # munge the base back together
+        cruft = ''
+        for (ridx, item) in enumerate(reversed(tokens)):
+            if item == PostFix.LIST:
+                break
+            cruft += item
+        base = ''.join( tokens[:-ridx-1])
+        #io.rprint("PMS(array):  base=%s  cruft=%s ridx=%d" % (base, cruft, ridx))
+        
+        # fetch the base object
+        try:
+            obj = eval(base, self.namespace)
+        except:
+            try:
+                obj = eval(base, self.global_namespace)
+            except:
+                return []
+
+        # make a quick stab
+        listish = isinstance(obj, list)
+        dictish = isinstance(obj, dict)
+
+        # support list-ish and dict-ish stuff
+        if hasattr(obj, '__getitem__'):
+
+            # should firmly be a dictionary
+            if hasattr(obj, 'keys'):
+                dictish = True
+
+            try:
+                v = obj[0]
+                listish = True  # yup, some sort of list
+            except TypeError:
+                # wrong key type -- must be a general dictionary
+                dictish = True
+            except KeyError:
+                # is a dictionary if there ARE keys, but that wasn't one
+                if len(obj) > 0:
+                    dictish = True
+            except IndexError:
+                listish = True   # empty list
+
+        # define the preceeding text
+        if self.greedy:
+            prefix = base + PostFix.LIST
+        else:
+            prefix = ''
+
+        # manage true lists
+        if listish:
+            #io.rprint("PSM(array) is " + str(type(obj)))
+            
+            # collect the length
+            if cruft == '':
+                if len(obj) == 0:
+                    #io.rprint("PSM(array) return len==0")
+                    return [ text ]
+                
+                # send back the bounds
+                #io.rprint("PSM(array) return len!=0 cruft is empty")
+                return [ prefix + '0' + PostFix.LIST_CLOSE,
+                         prefix + ('%d' % (len(obj)-1)) + PostFix.LIST_CLOSE]
+            
+            else:
+                # send back the options prefixed with 'cruft'
+                #io.rprint("PSM(array) return cruft=" + cruft)
+                items = []
+
+                for i in range(len(obj)):
+                    seg = ('%d' % i) + PostFix.LIST_CLOSE
+                    if seg.startswith(cruft):
+                        items.append( prefix + seg )
+                return items
+                    
+        if dictish:
+            add_start_quote = False
+            #io.rprint("PSM(dict) is " + str(type(obj)))
+            
+            # empty dictionary?
+            if len(obj) == 0:
+                return [ '' ]
+            
+            #io.rprint("CRUFT(A): |" + cruft + "|")
+            # identify the quoting style...
+            if cruft.startswith(PostFix.SQUOTE):
+                cruft = cruft.strip(PostFix.SQUOTE)
+                qstyle = PostFix.SQUOTE
+            elif cruft.startswith(PostFix.DQUOTE):
+                cruft = cruft.strip(PostFix.DQUOTE)
+                qstyle = PostFix.DQUOTE
+            else:
+                qstyle = PostFix.SQUOTE
+                add_start_quote = True
+            
+            #io.rprint("CRUFT(B): |" + cruft + "|" + prefix + "|")
+            comps = []
+
+            # generate the completions matching the cruft
+            for item in obj.keys():
+                if item.startswith(cruft):
+                    ccmd = prefix
+                    if self.greedy or add_start_quote:
+                        ccmd += qstyle
+                    ccmd += item + qstyle
+
+                    ccmd += PostFix.LIST_CLOSE
+                    comps.append( ccmd )
+
+            return comps
+
+        # hmm...
+        return []    
+
 
     def dispatch_custom_completer(self, text):
         #io.rprint("Custom! '%s' %s" % (text, self.custom_completers)) # dbg
